@@ -639,7 +639,7 @@ class MainWindow(QMainWindow):
                 top_parent = current_parent
                 current_parent = self.editor_widget.SendScintilla(QsciScintilla.SCI_GETFOLDPARENT, top_parent)
 
-            # Find the very last child of this root block
+            # Find the last child of this root block
             last_child = self.editor_widget.SendScintilla(QsciScintilla.SCI_GETLASTCHILD, top_parent, -1)
 
             if last_child > top_parent:
@@ -672,7 +672,7 @@ class MainWindow(QMainWindow):
         preview = code_to_run if len(code_lines) < 4 else f"{code_lines[0]} ... [Executed {len(code_lines)} lines]"
         self.console_output.appendPlainText(f"\n> {preview}")
 
-        # Beam it to the engine
+        # Send it to the engine
         if self.oscar_socket.state() == QTcpSocket.SocketState.ConnectedState:
             payload = code_to_run + '\n'
             self.oscar_socket.write(payload.encode('utf-8'))
@@ -797,14 +797,11 @@ class MainWindow(QMainWindow):
         about_dialog.setFixedSize(400, 200)
         text = QLabel(
             """
-## OSCAR IDE v0.1
+OSCAR IDE
 
-**Version**: 0.1
-**Status**: Prototype
+Version 0.1
 
-This is a free and open-source code editor and IDE for the OSCAR audio programming language.
-
-For more information, visit the [OSCAR homepage](https://oscar-language.github.io).
+by Zeloof Designworks, LLC
             """
         )
         text.setAlignment(Qt.AlignmentFlag.AlignCenter)
