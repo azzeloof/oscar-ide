@@ -553,14 +553,16 @@ class MultiScopeWidget(QWidget):
         self.samples_dict = {}  # { name: samples }
         self.colors_dict = {}   # { name: color }
         self.visible_synths = set()
+        self.fractional_offset = 0.0
         
         self.trigger_level = 0.0
         self._dragging_trigger = False
         
-    def update_samples(self, samples_dict, colors_dict, visible_synths):
+    def update_samples(self, samples_dict, colors_dict, visible_synths, fractional_offset=0.0):
         self.samples_dict = samples_dict
         self.colors_dict = colors_dict
         self.visible_synths = visible_synths
+        self.fractional_offset = fractional_offset
         
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -612,8 +614,14 @@ class MultiScopeWidget(QWidget):
             
             path = QPainterPath()
             num_samples = len(samples)
+            if num_samples <= 1:
+                continue
+                
+            x_step = width / max(1, num_samples - 2)
+            x_shift = -self.fractional_offset * x_step
+            
             for i, val in enumerate(samples):
-                x = (i / max(1, num_samples - 1)) * width
+                x = (i * x_step) + x_shift
                 y = mid_y - (max(-1.0, min(1.0, val)) * (mid_y - 5))
                 if i == 0:
                     path.moveTo(x, y)
@@ -780,33 +788,51 @@ class TelemetryBay(QWidget):
         blocks_needed = (timebase // 1024) + 2
         
         display_dict = {}
+        fractional_offset = 0.0
         
         if self.trigger_source == "Free Run" or self.trigger_source not in self.unified_buffer:
             for name in self.visible_synths:
                 flat = self._assemble_flat_buffer(name, blocks_needed, anchor_block)
-                if len(flat) > timebase:
-                    flat = flat[-timebase:]
+                if len(flat) > timebase + 1:
+                    flat = flat[-(timebase + 1):]
                 display_dict[name] = flat
         else:
             source_flat = self._assemble_flat_buffer(self.trigger_source, blocks_needed, anchor_block)
             if source_flat:
                 trigger_index = -1
+                hysteresis_margin = 0.05
+                
                 for i in range(len(source_flat) - 1, 0, -1):
                     if source_flat[i-1] <= level and source_flat[i] > level:
-                        trigger_index = i
-                        if len(source_flat) - trigger_index >= timebase:
-                            break
-                            
+                        valid_trigger = False
+                        for j in range(i-1, -1, -1):
+                            if source_flat[j] < level - hysteresis_margin:
+                                valid_trigger = True
+                                break
+                            elif source_flat[j] > level:
+                                break
+                                
+                        if valid_trigger:
+                            trigger_index = i
+                            if len(source_flat) - trigger_index >= timebase:
+                                y0 = source_flat[i-1]
+                                y1 = source_flat[i]
+                                if y1 != y0:
+                                    fractional_offset = (level - y0) / (y1 - y0)
+                                break
+                            else:
+                                trigger_index = -1
+                                
                 if trigger_index == -1:
                     trigger_index = max(0, len(source_flat) - timebase)
                     
                 for name in self.visible_synths:
                     flat = self._assemble_flat_buffer(name, blocks_needed, anchor_block)
                     if trigger_index < len(flat):
-                        sliced = flat[trigger_index : trigger_index + timebase]
+                        sliced = flat[trigger_index : trigger_index + timebase + 1]
                         display_dict[name] = sliced
                         
-        self.scope.update_samples(display_dict, self.synth_colors, self.visible_synths)
+        self.scope.update_samples(display_dict, self.synth_colors, self.visible_synths, fractional_offset)
         self.scope.update()
 
 class MainWindow(QMainWindow):
@@ -818,15 +844,15 @@ class MainWindow(QMainWindow):
         self.resize(1600, 1000)
         
         self.synth_colors = {}
-        self.color_palette = [
-            QColor("#00ff00"), # Green
-            QColor("#00ffff"), # Cyan
-            QColor("#ff00ff"), # Magenta
-            QColor("#ffff00"), # Yellow
-            QColor("#ff8800"), # Orange
-            QColor("#0088ff"), # Blue
-            QColor("#ff0088"), # Pink
-            QColor("#88ff00")  # Lime
+        self.color_palette = [ # Color names from Novation LaunchControl XL
+            QColor("#4bfd58"), # Vibrant Green
+            QColor("#18d7ff"), # Vibrant Light Blue
+            QColor("#1f56da"), # Vibrant Dark Blue
+            QColor("#9635ff"), # Vibrant Purple
+            QColor("#f226fe"), # Vibrant Fuschia
+            QColor("#ff0100"), # Vibrant Red
+            QColor("#ff881b"), # Vibrant Orange
+            QColor("#faff06")  # Vibrant Yellow
         ]
 
         # Enable freeform docking
