@@ -1,0 +1,6 @@
+{
+  "python_keywords": ["def", "class", "if", "elif", "else", "while", "for", "in", "return", "import", "from", "True", "False", "None", "and", "or", "not", "with", "as", "pass", "break", "continue", "yield", "try", "except", "finally"],
+  "oscar_classes": ["Synth", "Patch", "Scope", "master", "Control", "MidiInput"],
+  "oscar_methods": ["freq", "play", "stop", "getSynths", "getPatches", "stopAll", "shutdown", "mod", "add_osc", "set_filter", "amp", "pan", "phase", "wave", "visualize", "thickness", "color", "blur", "samples", "alphaScale", "scale", "register_callback", "update", "devices"],
+  "oscar_constants": ["SINE", "SQUARE", "SAW", "TRIANGLE", "sine", "square", "saw", "triangle"]
+}

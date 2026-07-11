@@ -1,0 +1,67 @@
+QMainWindow, QDockWidget { 
+    background-color: #202020; 
+    color: white; 
+}
+
+QPlainTextEdit, QLineEdit { 
+    background-color: #1e1e1e; 
+    color: #d4d4d4; 
+    border: 1px solid #333; 
+}
+
+QPlainTextEdit, QLineEdit {
+    font-family: Consolas, monospace;
+}
+
+QLineEdit {
+    padding: 5px;
+}
+
+QsciScintilla { 
+    border: none; 
+}
+
+QMenuBar { 
+    background-color: #333; 
+    color: white; 
+}
+
+QMenuBar::item:selected { 
+    background-color: #555; 
+}
+
+QDockWidget::title { 
+    background: #2d2d2d; 
+    padding: 6px; 
+}
+
+QMenu {
+    background-color: #2b2b2b;
+    color: white;
+    border: 1px solid #444;
+}
+
+QMenu::item:selected {
+    background-color: #444;
+}
+
+QSpinBox {
+    background-color: #2b2b2b;
+    color: #d4d4d4;
+    border: 1px solid #444;
+}
+
+QStatusBar {
+    background-color: #1e1e1e;
+    color: #d4d4d4;
+    border-top: 1px solid #444;
+}
+
+QLabel#PreviewLabel {
+    background-color: black;
+    color: #555;
+}
+
+QStatusBar QLabel, QMenu QLabel {
+    color: #d4d4d4;
+}

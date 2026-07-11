@@ -14,9 +14,13 @@ from PyQt6.QtGui import (QAction, QColor, QFont, QShortcut, QKeySequence, QPixma
                          QPainterPath, QPen, QBrush, QColor, QPainter,
                          QPainterPathStroker)
 from PyQt6.QtCore import Qt, QSettings, QTimer, QPointF, QRectF, QProcess
-from PyQt6.Qsci import QsciScintilla, QsciLexerPython
+from PyQt6.Qsci import QsciScintilla, QsciLexerPython, QsciAPIs
+from lexer import OscarLexer
 from PyQt6.QtNetwork import QTcpSocket, QTcpServer, QHostAddress, QUdpSocket
-
+from PyQt6.QtCore import QRunnable, QObject, QThreadPool, pyqtSignal
+from PyQt6.QtGui import QImage
+import collections
+import itertools
 
 class ScintillaEditor(QsciScintilla):
     """A fully-featured code editor widget using QScintilla."""
@@ -29,23 +33,9 @@ class ScintillaEditor(QsciScintilla):
         self.setFont(editor_font)
         self.setMarginsFont(editor_font)
         # Syntax Highlighting (The Lexer)
-        self.lexer = QsciLexerPython()
-        self.lexer.setDefaultFont(editor_font)
-        self.lexer.setFont(editor_font, QsciLexerPython.Comment)
-
-        # Customize Lexer colors for a VS Code-style dark theme
-        self.lexer.setDefaultPaper(QColor("#1e1e1e"))  # Background
-        self.lexer.setDefaultColor(QColor("#d4d4d4"))  # Default text
-        self.lexer.setColor(QColor("#569cd6"), QsciLexerPython.Keyword)
-        self.lexer.setColor(QColor("#ce9178"), QsciLexerPython.DoubleQuotedString)
-        self.lexer.setColor(QColor("#ce9178"), QsciLexerPython.SingleQuotedString)
-        self.lexer.setColor(QColor("#6a9955"), QsciLexerPython.Comment)
-        self.lexer.setColor(QColor("#b5cea8"), QsciLexerPython.Number)
-        self.lexer.setColor(QColor("#dcdcaa"), QsciLexerPython.Decorator)
-        self.lexer.setColor(QColor("#dcdcaa"), QsciLexerPython.FunctionMethodName)
-        self.lexer.setColor(QColor("#4EC9B0"), QsciLexerPython.ClassName)
-
+        self.lexer = OscarLexer(self)
         self.setLexer(self.lexer)
+        self.setup_autocompletion()
 
         # Line Numbers (Margins)
         self.setMarginType(0, QsciScintilla.MarginType.NumberMargin)
@@ -158,6 +148,82 @@ class ScintillaEditor(QsciScintilla):
                 
             indic_idx += 1
 
+    def _find_oscar_py(self):
+        import os
+        
+        # We need to know where oscar-lc is.
+        # Assuming oscar-ide and oscar-lc are siblings:
+        ide_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        parent_dir = os.path.dirname(ide_root)
+        guess_path = os.path.join(parent_dir, 'oscar-lc', 'src', 'oscar.py')
+        if os.path.exists(guess_path):
+            return guess_path
+            
+        return None
+
+    def setup_autocompletion(self):
+        self.api = QsciAPIs(self.lexer)
+        if hasattr(self.lexer, 'api_data'):
+            for kw in self.lexer.api_data.get("python_keywords", []):
+                self.api.add(kw)
+                
+        # Dynamically load OSCAR classes and methods from oscar.py
+        oscar_py_path = self._find_oscar_py()
+        if oscar_py_path:
+            import ast
+            try:
+                with open(oscar_py_path, 'r', encoding='utf-8') as f:
+                    tree = ast.parse(f.read())
+                
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ClassDef):
+                        # Only include relevant classes
+                        if node.name in ["Synth", "Patch", "Master", "Scope", "Renderer", "Control", "MidiInput"]:
+                            self.api.add(node.name)
+                            # Add methods
+                            for item in node.body:
+                                if isinstance(item, ast.FunctionDef) and not item.name.startswith('_'):
+                                    defaults = item.args.defaults
+                                    args_list = item.args.args
+                                    default_offset = len(args_list) - len(defaults)
+                                    args = []
+                                    for i, arg in enumerate(args_list):
+                                        if arg.arg != 'self':
+                                            arg_str = arg.arg
+                                            if arg.annotation:
+                                                arg_str += f": {ast.unparse(arg.annotation)}"
+                                            if i >= default_offset:
+                                                default_val = ast.unparse(defaults[i - default_offset])
+                                                arg_str += f"={default_val}"
+                                            args.append(arg_str)
+                                    args_str = ", ".join(args)
+                                    doc = ast.get_docstring(item)
+                                    if doc:
+                                        # First sentence of docstring for brevity in popup
+                                        short_doc = doc.strip().split('\n')[0]
+                                        self.api.add(f"{item.name}({args_str}) - {short_doc}")
+                                    else:
+                                        self.api.add(f"{item.name}({args_str})")
+            except Exception as e:
+                print(f"Failed to parse oscar.py for hinting: {e}")
+        else:
+            # Fallback to static JSON
+            if hasattr(self.lexer, 'api_data'):
+                for cls in self.lexer.api_data.get("oscar_classes", []):
+                    self.api.add(cls)
+                for method in self.lexer.api_data.get("oscar_methods", []):
+                    self.api.add(method)
+                for const in self.lexer.api_data.get("oscar_constants", []):
+                    self.api.add(const)
+                    
+        self.api.prepare()
+        self.setAutoCompletionSource(QsciScintilla.AutoCompletionSource.AcsAll)
+        self.setAutoCompletionThreshold(2)
+        
+        # Setup Call Tips for function hinting
+        self.setCallTipsStyle(QsciScintilla.CallTipsStyle.CallTipsNoContext)
+        self.setCallTipsVisible(-1)
+
 
 from PyQt6.QtGui import QPainterPathStroker
 
@@ -173,7 +239,8 @@ class PatchWire(QGraphicsPathItem):
         self.synth_name = synth_name
         self.channel_num = channel_num
 
-        self.pen = QPen(QColor("#4EC9B0"))
+        self.base_color = QColor("#4EC9B0")
+        self.pen = QPen(self.base_color)
         self.pen.setWidth(2)
 
         if is_temp:
@@ -182,9 +249,24 @@ class PatchWire(QGraphicsPathItem):
         else:
             # Enable selection for permanent wires
             self.setFlag(QGraphicsPathItem.GraphicsItemFlag.ItemIsSelectable, True)
+            self.setAcceptHoverEvents(True)
 
         self.setPen(self.pen)
         self.update_positions(start_pos, end_pos)
+
+    def hoverEnterEvent(self, event):
+        if not self.isSelected():
+            self.pen.setColor(self.base_color.lighter(130))
+            self.pen.setWidth(3)
+            self.setPen(self.pen)
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        if not self.isSelected():
+            self.pen.setColor(self.base_color)
+            self.pen.setWidth(2)
+            self.setPen(self.pen)
+        super().hoverLeaveEvent(event)
 
     def update_positions(self, start_pos, end_pos):
         """Recalculates the Bezier curve on the fly."""
@@ -210,7 +292,7 @@ class PatchWire(QGraphicsPathItem):
                 self.pen.setColor(QColor("#ffffff"))
                 self.pen.setWidth(4)
             else:  # Deselected
-                self.pen.setColor(QColor("#4EC9B0"))
+                self.pen.setColor(self.base_color)
                 self.pen.setWidth(2)
             self.setPen(self.pen)
         return super().itemChange(change, value)
@@ -278,7 +360,7 @@ class PatchBayView(QGraphicsView):
 
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setBackgroundBrush(QBrush(QColor("#1e1e1e")))
-        self.setStyleSheet("border: none;")
+        self
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)  # Allows drag-to-select multiple wires!
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
@@ -377,7 +459,8 @@ class PatchBayView(QGraphicsView):
                 # Pass metadata into the wire so we know what to delete later
                 wire = PatchWire(start_pos, end_pos, synth_name=s_name, channel_num=ch)
                 if s_name in self.synth_colors:
-                    wire.pen.setColor(self.synth_colors[s_name])
+                    wire.base_color = self.synth_colors[s_name]
+                    wire.pen.setColor(wire.base_color)
                     wire.setPen(wire.pen)
                 self.scene.addItem(wire)
 
@@ -493,7 +576,6 @@ class SynthLabel(QLabel):
             QLabel {{
                 background-color: {bg};
                 color: {fg};
-                border: 1px solid {self.synth_color.name()};
                 border-radius: 4px;
             }}
         """)
@@ -505,18 +587,13 @@ class SynthLabel(QLabel):
             self.clicked.emit(self.synth_name)
         elif event.button() == Qt.MouseButton.RightButton and self.synth_name != "Free Run":
             menu = QMenu(self)
-            menu.setStyleSheet("""
-                QMenu { background-color: #2b2b2b; color: #d4d4d4; border: 1px solid #444; }
-                QMenu::item { padding: 5px 20px; }
-                QMenu::item:selected { background-color: #4EC9B0; color: #1e1e1e; }
-            """)
             
             vis_widget = QWidget()
             vis_layout = QHBoxLayout(vis_widget)
             vis_layout.setContentsMargins(10, 5, 10, 5)
             
             vis_checkbox = QCheckBox("Visible on Scope")
-            vis_checkbox.setStyleSheet("color: #d4d4d4;")
+            vis_checkbox
             vis_checkbox.setChecked(self.is_visible_on_scope)
             
             def on_vis_toggled(checked):
@@ -538,7 +615,7 @@ class SynthLabel(QLabel):
             action = menu.exec(event.globalPosition().toPoint())
             
             if action == change_color_action:
-                color = QColorDialog.getColor(self.synth_color, self, "Select Synth Color")
+                color = QColorDialog.getColor(self.synth_color, None, "Select Synth Color")
                 if color.isValid():
                     self.set_color(color)
                     self.color_changed.emit(self.synth_name, color)
@@ -650,11 +727,7 @@ class ConnectionStatusLabel(QLabel):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
             menu = QMenu(self)
-            menu.setStyleSheet("""
-                QMenu { background-color: #2b2b2b; color: #d4d4d4; border: 1px solid #444; }
-                QMenu::item { padding: 5px 20px; }
-                QMenu::item:selected { background-color: #4EC9B0; color: #1e1e1e; }
-            """)
+            menu
             launch_action = menu.addAction(f"Launch {self.name}")
             action = menu.exec(event.globalPosition().toPoint())
             if action == launch_action:
@@ -721,12 +794,8 @@ class TelemetryBay(QWidget):
             
     def push_telemetry(self, synth_name, block_index, samples):
         if synth_name not in self.unified_buffer:
-            self.unified_buffer[synth_name] = {}
-        self.unified_buffer[synth_name][block_index] = samples
-        
-        if len(self.unified_buffer[synth_name]) > 8:
-            oldest = min(self.unified_buffer[synth_name].keys())
-            del self.unified_buffer[synth_name][oldest]
+            self.unified_buffer[synth_name] = collections.deque(maxlen=16)
+        self.unified_buffer[synth_name].append((block_index, samples))
             
         self.last_block_index = max(self.last_block_index, block_index)
         
@@ -765,20 +834,18 @@ class TelemetryBay(QWidget):
             return []
             
         buf = self.unified_buffer[synth_name]
+        buf_dict = {b: s for b, s in buf}
         blocks_to_concat = []
         
         for b in range(anchor_block, anchor_block - blocks_to_fetch, -1):
-            if b in buf:
-                blocks_to_concat.append(buf[b])
+            if b in buf_dict:
+                blocks_to_concat.append(buf_dict[b])
             else:
                 blocks_to_concat.append([0.0] * 1024)
                 
         blocks_to_concat.reverse()
         
-        flat = []
-        for b_data in blocks_to_concat:
-            flat.extend(b_data)
-        return flat
+        return list(itertools.chain.from_iterable(blocks_to_concat))
 
     def repaint_scopes(self):
         timebase = self.timebase_slider.value()
@@ -834,6 +901,26 @@ class TelemetryBay(QWidget):
                         
         self.scope.update_samples(display_dict, self.synth_colors, self.visible_synths, fractional_offset)
         self.scope.update()
+
+class WorkerSignals(QObject):
+    frame_ready = pyqtSignal(QImage)
+
+class VideoDecoderTask(QRunnable):
+    def __init__(self, jpeg_data, target_size):
+        super().__init__()
+        self.jpeg_data = jpeg_data
+        self.target_size = target_size
+        self.signals = WorkerSignals()
+
+    def run(self):
+        image = QImage()
+        if image.loadFromData(self.jpeg_data):
+            scaled_image = image.scaled(
+                self.target_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.signals.frame_ready.emit(scaled_image)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -906,6 +993,13 @@ class MainWindow(QMainWindow):
             return False
 
     def closeEvent(self, event):
+        if hasattr(self, 'engine_process'):
+            self.engine_process.terminate()
+            self.engine_process.waitForFinished(1000)
+        if hasattr(self, 'render_process'):
+            self.render_process.terminate()
+            self.render_process.waitForFinished(1000)
+
         if self.check_unsaved_changes():
             self.save_layout()
             event.accept()
@@ -959,11 +1053,7 @@ class MainWindow(QMainWindow):
 
     def _show_synth_context_menu_with_vol(self, synth_name, global_pos, vol):
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu { background-color: #2b2b2b; color: #d4d4d4; border: 1px solid #444; }
-            QMenu::item { padding: 5px 20px; }
-            QMenu::item:selected { background-color: #4EC9B0; color: #1e1e1e; }
-        """)
+        menu
 
         vol_widget = QWidget()
         vol_layout = QHBoxLayout(vol_widget)
@@ -977,16 +1067,10 @@ class MainWindow(QMainWindow):
         spinbox.setRange(0.0, 1.0)
         spinbox.setSingleStep(0.01)
         spinbox.setValue(vol)
-        spinbox.setStyleSheet("""
-            QDoubleSpinBox {
-                background-color: #1e1e1e;
-                color: #d4d4d4;
-                border: 1px solid #444;
-            }
-        """)
+        spinbox
 
         mute_checkbox = QCheckBox("Mute")
-        mute_checkbox.setStyleSheet("color: #d4d4d4;")
+        mute_checkbox
         mute_checkbox.setChecked(self.patch_bay_widget.synth_muted.get(synth_name, False))
 
         def on_vol_changed(v):
@@ -1008,7 +1092,7 @@ class MainWindow(QMainWindow):
         mute_checkbox.toggled.connect(on_mute_toggled)
 
         vol_label = QLabel("Vol:")
-        vol_label.setStyleSheet("color: #d4d4d4;")
+        vol_label
         
         vol_layout.addWidget(vol_label)
         vol_layout.addWidget(slider)
@@ -1029,7 +1113,7 @@ class MainWindow(QMainWindow):
 
     def setup_status_bar(self):
         self.status_bar = self.statusBar()
-        self.status_bar.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; border-top: 1px solid #444;")
+        self.status_bar
         
         self.cpu_label = QLabel("CPU: 0.0%")
         self.cpu_label.setFont(QFont("Consolas", 10))
@@ -1055,23 +1139,9 @@ class MainWindow(QMainWindow):
         
     def update_cpu_load(self):
         try:
-            with open('/proc/stat', 'r') as f:
-                lines = f.readlines()
-            cpu_line = lines[0].split()[1:]
-            cpu_times = [float(x) for x in cpu_line]
-            
-            idle = cpu_times[3] + cpu_times[4] # idle + iowait
-            total = sum(cpu_times)
-            
-            idle_delta = idle - self.prev_idle
-            total_delta = total - self.prev_total
-            
-            self.prev_idle = idle
-            self.prev_total = total
-            
-            if total_delta > 0:
-                load = 100.0 * (1.0 - idle_delta / total_delta)
-                self.cpu_label.setText(f"CPU: {load:.1f}%")
+            import psutil
+            load = psutil.cpu_percent(interval=None)
+            self.cpu_label.setText(f"CPU: {load:.1f}%")
         except Exception:
             self.cpu_label.setText("CPU: N/A")
             
@@ -1103,7 +1173,7 @@ class MainWindow(QMainWindow):
         self.render_status.set_connected(True, "(0 FPS)")
 
     def read_video_frame(self):
-        """Reads the framed TCP stream, decodes the JPEG, and paints it."""
+        """Reads the framed TCP stream, decodes the JPEG in a background thread."""
         while True:
             # Read the 4-byte header if we are waiting for a new frame
             if self.expected_video_size == 0:
@@ -1119,18 +1189,16 @@ class MainWindow(QMainWindow):
                     jpeg_data = self.video_socket.read(self.expected_video_size)
                     self.expected_video_size = 0  # Reset state for the next frame
 
-                    # Decode and Paint
+                    # Decode and scale in background
                     self.frames_received += 1
-                    pixmap = QPixmap()
-                    if pixmap.loadFromData(jpeg_data):
-                        scaled_pixmap = pixmap.scaled(
-                            self.preview_label.size(),
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation
-                        )
-                        self.preview_label.setPixmap(scaled_pixmap)
+                    task = VideoDecoderTask(jpeg_data, self.preview_label.size())
+                    task.signals.frame_ready.connect(self._on_frame_decoded)
+                    QThreadPool.globalInstance().start(task)
                 else:
                     break  # Payload is partially here, wait for the rest
+
+    def _on_frame_decoded(self, image):
+        self.preview_label.setPixmap(QPixmap.fromImage(image))
 
     def setup_shortcuts(self):
         # Bind Ctrl+Enter (Return) to execute code
@@ -1215,13 +1283,17 @@ class MainWindow(QMainWindow):
                 start_line = top_parent
                 end_line = last_child
 
-                # Peek at the next line to catch orphaned closing brackets
-                next_line = end_line + 1
-                if next_line < self.editor_widget.lines():
-                    next_text = self.editor_widget.text(next_line).strip()
-                    # If the next line is a closing character (or comma-trailing closure)
-                    if next_text in (']', ')', '}', '],', '),', '},', '"""', "'''"):
-                        end_line = next_line
+                # Peek ahead to catch orphaned closing brackets
+                scan_line = end_line + 1
+                while scan_line < self.editor_widget.lines():
+                    next_text = self.editor_widget.text(scan_line).strip()
+                    if not next_text:
+                        scan_line += 1
+                    elif next_text in (']', ')', '}', '],', '),', '},', '"""', "'''"):
+                        end_line = scan_line
+                        scan_line += 1
+                    else:
+                        break
             else:
                 start_line = line
                 end_line = line
@@ -1251,12 +1323,19 @@ class MainWindow(QMainWindow):
 
     def read_oscar_stdout(self):
         """Receives live prints from the OSCAR engine and intercepts UI state syncs."""
-        data = self.oscar_socket.readAll().data().decode('utf-8')
-        self.stdout_buffer += data
+        if not hasattr(self, 'stdout_bytes_buffer'):
+            self.stdout_bytes_buffer = b""
+            
+        self.stdout_bytes_buffer += self.oscar_socket.readAll().data()
 
         # Process complete lines one by one
-        while '\n' in self.stdout_buffer:
-            line, self.stdout_buffer = self.stdout_buffer.split('\n', 1)
+        while b'\n' in self.stdout_bytes_buffer:
+            line_bytes, self.stdout_bytes_buffer = self.stdout_bytes_buffer.split(b'\n', 1)
+            try:
+                line = line_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                continue
+
 
             # Did the engine send a hidden UI update?
             if line.startswith("__STATE_SYNC__:"):
@@ -1337,6 +1416,20 @@ class MainWindow(QMainWindow):
         window_menu.addAction(self.preview_dock.toggleViewAction())
         window_menu.addAction(self.patch_dock.toggleViewAction())
         window_menu.addAction(self.telemetry_dock.toggleViewAction())
+
+
+
+        font_action = QAction("Editor Font...", self)
+        font_action.triggered.connect(self.select_editor_font)
+        window_menu.addAction(font_action)
+
+    def select_editor_font(self):
+        from PyQt6.QtWidgets import QFontDialog
+        font, ok = QFontDialog.getFont(self.editor_widget.font(), None, "Select Editor Font")
+        if ok:
+            self.editor_widget.setFont(font)
+            self.editor_widget.setMarginsFont(font)
+            self.editor_widget.lexer.setDefaultFont(font)
 
     def setup_file_menu(self):
         file_menu = self.menuBar().addMenu("File")
@@ -1446,11 +1539,15 @@ by Zeloof Designworks, LLC
         oscar_settings_dialog.exec()
 
     def launch_engine(self):
+        if hasattr(self, 'engine_process') and self.engine_process.state() != QProcess.ProcessState.NotRunning:
+            return
         self.console_output.appendPlainText(f"> Launching Engine: {self.oscar_engine_path}")
         self.engine_process = QProcess(self)
         self.engine_process.startCommand(self.oscar_engine_path)
 
     def launch_render(self):
+        if hasattr(self, 'render_process') and self.render_process.state() != QProcess.ProcessState.NotRunning:
+            return
         self.console_output.appendPlainText(f"> Launching Renderer: {self.oscar_render_path}")
         self.render_process = QProcess(self)
         self.render_process.startCommand(self.oscar_render_path)
@@ -1489,7 +1586,7 @@ by Zeloof Designworks, LLC
 
     def save_as_file(self):
         filepath, _ = QFileDialog.getSaveFileName(
-            self, "Save File", "", "OSCAR Files (*.os);;Python Files (*.py);;All Files (*)"
+            None, "Save File", "", "OSCAR Files (*.os);;Python Files (*.py);;All Files (*)"
         )
         if filepath:
             self.current_filepath = filepath
@@ -1558,11 +1655,9 @@ by Zeloof Designworks, LLC
 
         self.console_output = QPlainTextEdit("> ready.\n")
         self.console_output.setReadOnly(True)
-        self.console_output.setStyleSheet("font-family: Consolas, monospace;")
 
-        self.console_input = QLineEdit()
+        self.console_input = QLineEdit(self)
         self.console_input.setPlaceholderText("Enter command...")
-        self.console_input.setStyleSheet("font-family: Consolas, monospace; padding: 5px;")
 
         console_layout.addWidget(self.console_output)
         console_layout.addWidget(self.console_input)
@@ -1574,7 +1669,7 @@ by Zeloof Designworks, LLC
         self.preview_dock = QDockWidget("Preview", self)
         self.preview_dock.setObjectName("PreviewDock")
         self.preview_label = QLabel("Waiting for render feed...", alignment=Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setStyleSheet("background-color: black; color: #555;")
+        self.preview_label.setObjectName("PreviewLabel")
         self.preview_dock.setWidget(self.preview_label)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.preview_dock)
 
@@ -1601,15 +1696,13 @@ if __name__ == "__main__":
     font.setPointSize(12)
     app.setFont(font)
 
-    app.setStyleSheet("""
-        QMainWindow, QDockWidget { background-color: #202020; color: white; }
-        QPlainTextEdit, QLineEdit { background-color: #1e1e1e; color: #d4d4d4; border: 1px solid #333; }
-        QsciScintilla { border: none; }
-        QMenuBar { background-color: #333; color: white; }
-        QMenuBar::item:selected { background-color: #555; }
-        QDockWidget::title { background: #2d2d2d; padding: 6px; }
-    """)
-
     window = MainWindow()
+
+    import os
+    style_path = os.path.join(os.path.dirname(__file__), "styles", "style.qss")
+    if os.path.exists(style_path):
+        with open(style_path, "r") as f:
+            window.setStyleSheet(f.read())
+
     window.show()
     sys.exit(app.exec())
