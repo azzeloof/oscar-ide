@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import struct
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QDockWidget, QLineEdit, QDialog, QPlainTextEdit,
                              QLabel, QFileDialog, QMessageBox, QGraphicsView,
@@ -8,13 +9,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QGraphicsRectItem, QGraphicsTextItem, QFormLayout,
                              QPushButton, QGridLayout, QMenu, QInputDialog,
                              QSlider, QDoubleSpinBox, QHBoxLayout, QWidgetAction,
-                             QCheckBox)
+                             QCheckBox, QScrollArea, QComboBox)
 from PyQt6.QtGui import (QAction, QColor, QFont, QShortcut, QKeySequence, QPixmap,
                          QPainterPath, QPen, QBrush, QColor, QPainter,
                          QPainterPathStroker)
 from PyQt6.QtCore import Qt, QSettings, QTimer, QPointF, QRectF, QProcess
 from PyQt6.Qsci import QsciScintilla, QsciLexerPython
-from PyQt6.QtNetwork import QTcpSocket, QTcpServer, QHostAddress
+from PyQt6.QtNetwork import QTcpSocket, QTcpServer, QHostAddress, QUdpSocket
 
 
 class ScintillaEditor(QsciScintilla):
@@ -73,12 +74,17 @@ class ScintillaEditor(QsciScintilla):
         self.SendScintilla(QsciScintilla.SCI_INDICSETSTYLE, self.FLASH_INDICATOR, QsciScintilla.INDIC_STRAIGHTBOX)
         self.SendScintilla(QsciScintilla.SCI_INDICSETFORE, self.FLASH_INDICATOR, QColor("#ffffff"))
         self.SendScintilla(QsciScintilla.SCI_INDICSETUNDER, self.FLASH_INDICATOR, True)  # Draw beneath text
+        
+        self.SYNTH_INDICATORS_START = 9
 
         self.flash_timer = QTimer(self)
         self.flash_timer.timeout.connect(self._fade_flash)
         self.flash_alpha = 0
         self.flash_start_pos = 0
         self.flash_length = 0
+        
+        self.current_synth_colors = {}
+        self.textChanged.connect(self._on_text_changed)
 
     def flash_lines(self, start_line, end_line):
         """Highlights a block of lines and begins the fade animation."""
@@ -119,6 +125,38 @@ class ScintillaEditor(QsciScintilla):
         else:
             self.SendScintilla(QsciScintilla.SCI_INDICSETALPHA, self.FLASH_INDICATOR, self.flash_alpha)
             self.SendScintilla(QsciScintilla.SCI_INDICSETOUTLINEALPHA, self.FLASH_INDICATOR, self.flash_alpha)
+
+    def _on_text_changed(self):
+        if self.current_synth_colors:
+            self.update_synth_highlights(self.current_synth_colors)
+            
+    def update_synth_highlights(self, synth_colors):
+        self.current_synth_colors = synth_colors
+        import re
+        
+        # Clear all previous synth indicators
+        for i in range(self.SYNTH_INDICATORS_START, self.SYNTH_INDICATORS_START + 16):
+            self.SendScintilla(QsciScintilla.SCI_SETINDICATORCURRENT, i)
+            self.SendScintilla(QsciScintilla.SCI_INDICATORCLEARRANGE, 0, self.length())
+            
+        if not synth_colors:
+            return
+            
+        indic_idx = self.SYNTH_INDICATORS_START
+        text = self.text()
+        
+        for synth_name, color in synth_colors.items():
+            if indic_idx > self.SYNTH_INDICATORS_START + 15:
+                break
+                
+            self.SendScintilla(QsciScintilla.SCI_INDICSETSTYLE, indic_idx, QsciScintilla.INDIC_SQUIGGLE)
+            self.SendScintilla(QsciScintilla.SCI_INDICSETFORE, indic_idx, color)
+            self.SendScintilla(QsciScintilla.SCI_SETINDICATORCURRENT, indic_idx)
+            
+            for match in re.finditer(rf'\b{re.escape(synth_name)}\b', text):
+                self.SendScintilla(QsciScintilla.SCI_INDICATORFILLRANGE, match.start(), match.end() - match.start())
+                
+            indic_idx += 1
 
 
 from PyQt6.QtGui import QPainterPathStroker
@@ -181,12 +219,13 @@ class PatchWire(QGraphicsPathItem):
 class PatchNode(QGraphicsRectItem):
     """A dense, list-style node representing a Synth or a Channel."""
 
-    def __init__(self, name, node_type="synth", width=100, height=26):
+    def __init__(self, name, node_type="synth", width=100, height=26, color=None):
         super().__init__(0, 0, width, height)
         self.name = name
         self.node_type = node_type
+        self.base_color = color if color else QColor("#333333")
 
-        self.setBrush(QBrush(QColor("#333333")))
+        self.setBrush(QBrush(self.base_color))
         self.setPen(QPen(QColor("#1e1e1e"), 1))
 
         self.text = QGraphicsTextItem(name, self)
@@ -223,10 +262,10 @@ class PatchNode(QGraphicsRectItem):
         """Visually pops the node when a wire is hovering over it."""
         if active:
             self.setPen(QPen(QColor("#4EC9B0"), 2))
-            self.setBrush(QBrush(QColor("#444444")))  # Lighten background
+            self.setBrush(QBrush(self.base_color.lighter(130)))
         else:
             self.setPen(QPen(QColor("#1e1e1e"), 1))
-            self.setBrush(QBrush(QColor("#333333")))
+            self.setBrush(QBrush(self.base_color))
 
 
 class PatchBayView(QGraphicsView):
@@ -277,10 +316,11 @@ class PatchBayView(QGraphicsView):
         if synth_name in self.nodes:
             self.nodes[synth_name].set_volume_icon(is_muted)
 
-    def update_patch_bay(self, synths: list, channels: list, patches: list):
+    def update_patch_bay(self, synths: list, channels: list, patches: list, synth_colors=None):
         self._synths = synths
         self._channels = channels
         self._patches = patches
+        self.synth_colors = synth_colors or {}
         
         for s in synths:
             if s not in self.synth_volumes and self.query_volume_callback:
@@ -302,7 +342,10 @@ class PatchBayView(QGraphicsView):
         # Draw Synths
         y_pos = 0
         for synth_name in self._synths:
-            node = PatchNode(synth_name, "synth", self.node_width, self.node_height)
+            c = self.synth_colors.get(synth_name, QColor("#333333"))
+            bg_color = QColor(c.red() // 3, c.green() // 3, c.blue() // 3)
+            
+            node = PatchNode(synth_name, "synth", self.node_width, self.node_height, color=bg_color)
             node.set_volume_icon(self.synth_muted.get(synth_name, False))
             node.setPos(0, y_pos)
             self.scene.addItem(node)
@@ -333,6 +376,9 @@ class PatchBayView(QGraphicsView):
 
                 # Pass metadata into the wire so we know what to delete later
                 wire = PatchWire(start_pos, end_pos, synth_name=s_name, channel_num=ch)
+                if s_name in self.synth_colors:
+                    wire.pen.setColor(self.synth_colors[s_name])
+                    wire.setPen(wire.pen)
                 self.scene.addItem(wire)
 
     # --- Mouse & Keyboard Overrides ---
@@ -406,6 +452,363 @@ class PatchBayView(QGraphicsView):
         super().keyPressEvent(event)
 
 
+from PyQt6.QtWidgets import QColorDialog
+from PyQt6.QtCore import pyqtSignal
+
+class SynthLabel(QLabel):
+    clicked = pyqtSignal(str)
+    color_changed = pyqtSignal(str, QColor)
+    visibility_toggled = pyqtSignal(str, bool)
+
+    def __init__(self, name, color, parent=None):
+        super().__init__(name, parent)
+        self.synth_name = name
+        self.synth_color = color
+        self.is_active_trigger = False
+        self.is_visible_on_scope = True
+        
+        self.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setContentsMargins(10, 5, 10, 5)
+        self.update_style()
+        
+    def set_active_trigger(self, is_active):
+        self.is_active_trigger = is_active
+        self.update_style()
+        
+    def set_color(self, color):
+        self.synth_color = color
+        self.update_style()
+
+    def update_style(self):
+        bg = self.synth_color.name() if self.is_active_trigger else "#333333"
+        fg = "#000000" if self.is_active_trigger else self.synth_color.name()
+        
+        if not self.is_visible_on_scope:
+            bg = "#222222"
+            fg = "#555555"
+            
+        self.setStyleSheet(f"""
+            QLabel {{
+                background-color: {bg};
+                color: {fg};
+                border: 1px solid {self.synth_color.name()};
+                border-radius: 4px;
+            }}
+        """)
+        
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self.synth_name != "Free Run" and not self.is_visible_on_scope:
+                return # Can't trigger on hidden
+            self.clicked.emit(self.synth_name)
+        elif event.button() == Qt.MouseButton.RightButton and self.synth_name != "Free Run":
+            menu = QMenu(self)
+            menu.setStyleSheet("""
+                QMenu { background-color: #2b2b2b; color: #d4d4d4; border: 1px solid #444; }
+                QMenu::item { padding: 5px 20px; }
+                QMenu::item:selected { background-color: #4EC9B0; color: #1e1e1e; }
+            """)
+            
+            vis_widget = QWidget()
+            vis_layout = QHBoxLayout(vis_widget)
+            vis_layout.setContentsMargins(10, 5, 10, 5)
+            
+            vis_checkbox = QCheckBox("Visible on Scope")
+            vis_checkbox.setStyleSheet("color: #d4d4d4;")
+            vis_checkbox.setChecked(self.is_visible_on_scope)
+            
+            def on_vis_toggled(checked):
+                self.is_visible_on_scope = checked
+                if not self.is_visible_on_scope and self.is_active_trigger:
+                    self.clicked.emit("Free Run")
+                self.visibility_toggled.emit(self.synth_name, self.is_visible_on_scope)
+                self.update_style()
+                
+            vis_checkbox.toggled.connect(on_vis_toggled)
+            vis_layout.addWidget(vis_checkbox)
+            
+            vis_action = QWidgetAction(menu)
+            vis_action.setDefaultWidget(vis_widget)
+            menu.addAction(vis_action)
+            
+            change_color_action = menu.addAction("Change Color")
+            
+            action = menu.exec(event.globalPosition().toPoint())
+            
+            if action == change_color_action:
+                color = QColorDialog.getColor(self.synth_color, self, "Select Synth Color")
+                if color.isValid():
+                    self.set_color(color)
+                    self.color_changed.emit(self.synth_name, color)
+
+
+class MultiScopeWidget(QWidget):
+    trigger_level_changed = pyqtSignal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(150)
+        self.samples_dict = {}  # { name: samples }
+        self.colors_dict = {}   # { name: color }
+        self.visible_synths = set()
+        
+        self.trigger_level = 0.0
+        self._dragging_trigger = False
+        
+    def update_samples(self, samples_dict, colors_dict, visible_synths):
+        self.samples_dict = samples_dict
+        self.colors_dict = colors_dict
+        self.visible_synths = visible_synths
+        
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging_trigger = True
+            self._update_trigger_from_mouse(event.pos())
+            
+    def mouseMoveEvent(self, event):
+        if self._dragging_trigger:
+            self._update_trigger_from_mouse(event.pos())
+            
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging_trigger = False
+            
+    def _update_trigger_from_mouse(self, pos):
+        rect = self.rect()
+        mid_y = rect.height() / 2.0
+        val = (mid_y - pos.y()) / max(1, (mid_y - 5))
+        self.trigger_level = max(-1.0, min(1.0, val))
+        self.trigger_level_changed.emit(self.trigger_level)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+        
+        painter.fillRect(rect, QColor("#1e1e1e"))
+        painter.setPen(QColor("#333"))
+        painter.drawRect(0, 0, rect.width() - 1, rect.height() - 1)
+        
+        width = rect.width()
+        height = rect.height()
+        mid_y = height / 2.0
+        
+        trig_y = mid_y - (self.trigger_level * (mid_y - 5))
+        pen = QPen(QColor("#ffffff"))
+        pen.setStyle(Qt.PenStyle.DotLine)
+        pen.setWidth(1)
+        painter.setPen(pen)
+        painter.drawLine(0, int(trig_y), int(width), int(trig_y))
+        
+        for name, samples in self.samples_dict.items():
+            if name not in self.visible_synths or not samples:
+                continue
+                
+            color = self.colors_dict.get(name, QColor("#00ff00"))
+            painter.setPen(QPen(color, 1))
+            
+            path = QPainterPath()
+            num_samples = len(samples)
+            for i, val in enumerate(samples):
+                x = (i / max(1, num_samples - 1)) * width
+                y = mid_y - (max(-1.0, min(1.0, val)) * (mid_y - 5))
+                if i == 0:
+                    path.moveTo(x, y)
+                else:
+                    path.lineTo(x, y)
+                    
+            painter.drawPath(path)
+
+
+class ConnectionStatusLabel(QLabel):
+    def __init__(self, name, launch_callback, parent=None):
+        super().__init__(f"{name}: Disconnected", parent)
+        self.name = name
+        self.launch_callback = launch_callback
+        self.setStyleSheet("color: #ff5555;")
+        self.setFont(QFont("Consolas", 10))
+        
+    def set_connected(self, connected, extra_text=""):
+        if connected:
+            self.setText(f"{self.name}: Connected {extra_text}")
+            self.setStyleSheet("color: #4EC9B0;")
+        else:
+            self.setText(f"{self.name}: Disconnected")
+            self.setStyleSheet("color: #ff5555;")
+            
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            menu = QMenu(self)
+            menu.setStyleSheet("""
+                QMenu { background-color: #2b2b2b; color: #d4d4d4; border: 1px solid #444; }
+                QMenu::item { padding: 5px 20px; }
+                QMenu::item:selected { background-color: #4EC9B0; color: #1e1e1e; }
+            """)
+            launch_action = menu.addAction(f"Launch {self.name}")
+            action = menu.exec(event.globalPosition().toPoint())
+            if action == launch_action:
+                self.launch_callback()
+
+class TelemetryBay(QWidget):
+    color_changed = pyqtSignal(str, QColor)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(5, 5, 5, 5)
+        self.layout.setSpacing(5)
+        
+        # Toolbar
+        self.toolbar_widget = QWidget()
+        self.toolbar = QHBoxLayout(self.toolbar_widget)
+        self.toolbar.setContentsMargins(0, 0, 0, 0)
+        self.layout.addWidget(self.toolbar_widget)
+        
+        self.labels = {}
+        self.free_run_label = SynthLabel("Free Run", QColor("#888888"))
+        self.free_run_label.set_active_trigger(True)
+        self.free_run_label.clicked.connect(self.set_trigger_source)
+        self.toolbar.addWidget(self.free_run_label)
+        self.toolbar.addStretch()
+        
+        self.trigger_source = "Free Run"
+        
+        # Multi Scope
+        self.scope = MultiScopeWidget()
+        self.layout.addWidget(self.scope, stretch=1)
+        
+        # Timebase slider
+        self.timebase_slider = QSlider(Qt.Orientation.Horizontal)
+        self.timebase_slider.setRange(100, 8192)
+        self.timebase_slider.setValue(1024)
+        self.layout.addWidget(self.timebase_slider)
+        
+        self.unified_buffer = {}  # { synth_name: { block_index: samples } }
+        self.last_block_index = 0
+        self.visible_synths = set()
+        self.synth_colors = {}
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.repaint_scopes)
+        self.timer.start(33)
+        
+    def set_trigger_source(self, name):
+        self.trigger_source = name
+        self.free_run_label.set_active_trigger(name == "Free Run")
+        for lbl_name, lbl in self.labels.items():
+            lbl.set_active_trigger(lbl_name == name)
+            
+    def _on_color_changed(self, name, color):
+        self.synth_colors[name] = color
+        self.color_changed.emit(name, color)
+        
+    def _on_visibility_toggled(self, name, is_visible):
+        if is_visible:
+            self.visible_synths.add(name)
+        else:
+            self.visible_synths.discard(name)
+            
+    def push_telemetry(self, synth_name, block_index, samples):
+        if synth_name not in self.unified_buffer:
+            self.unified_buffer[synth_name] = {}
+        self.unified_buffer[synth_name][block_index] = samples
+        
+        if len(self.unified_buffer[synth_name]) > 8:
+            oldest = min(self.unified_buffer[synth_name].keys())
+            del self.unified_buffer[synth_name][oldest]
+            
+        self.last_block_index = max(self.last_block_index, block_index)
+        
+    def sync_synths(self, active_synths, synth_colors):
+        self.synth_colors = synth_colors
+        
+        current = set(self.labels.keys())
+        active = set(active_synths)
+        for name in current - active:
+            lbl = self.labels.pop(name)
+            self.toolbar.removeWidget(lbl)
+            lbl.deleteLater()
+            self.visible_synths.discard(name)
+            if self.trigger_source == name:
+                self.set_trigger_source("Free Run")
+                
+        new_synths = []
+        for name in active - current:
+            color = self.synth_colors.get(name, QColor("#00ff00"))
+            lbl = SynthLabel(name, color)
+            lbl.clicked.connect(self.set_trigger_source)
+            lbl.color_changed.connect(self._on_color_changed)
+            lbl.visibility_toggled.connect(self._on_visibility_toggled)
+            self.toolbar.insertWidget(self.toolbar.count() - 1, lbl)
+            self.labels[name] = lbl
+            self.visible_synths.add(name)
+            new_synths.append(name)
+            
+        for name in current.intersection(active):
+            self.labels[name].set_color(self.synth_colors[name])
+            
+        return new_synths
+        
+    def _assemble_flat_buffer(self, synth_name, blocks_to_fetch, anchor_block):
+        if synth_name not in self.unified_buffer:
+            return []
+            
+        buf = self.unified_buffer[synth_name]
+        blocks_to_concat = []
+        
+        for b in range(anchor_block, anchor_block - blocks_to_fetch, -1):
+            if b in buf:
+                blocks_to_concat.append(buf[b])
+            else:
+                blocks_to_concat.append([0.0] * 1024)
+                
+        blocks_to_concat.reverse()
+        
+        flat = []
+        for b_data in blocks_to_concat:
+            flat.extend(b_data)
+        return flat
+
+    def repaint_scopes(self):
+        timebase = self.timebase_slider.value()
+        level = self.scope.trigger_level
+        
+        anchor_block = self.last_block_index
+        blocks_needed = (timebase // 1024) + 2
+        
+        display_dict = {}
+        
+        if self.trigger_source == "Free Run" or self.trigger_source not in self.unified_buffer:
+            for name in self.visible_synths:
+                flat = self._assemble_flat_buffer(name, blocks_needed, anchor_block)
+                if len(flat) > timebase:
+                    flat = flat[-timebase:]
+                display_dict[name] = flat
+        else:
+            source_flat = self._assemble_flat_buffer(self.trigger_source, blocks_needed, anchor_block)
+            if source_flat:
+                trigger_index = -1
+                for i in range(len(source_flat) - 1, 0, -1):
+                    if source_flat[i-1] <= level and source_flat[i] > level:
+                        trigger_index = i
+                        if len(source_flat) - trigger_index >= timebase:
+                            break
+                            
+                if trigger_index == -1:
+                    trigger_index = max(0, len(source_flat) - timebase)
+                    
+                for name in self.visible_synths:
+                    flat = self._assemble_flat_buffer(name, blocks_needed, anchor_block)
+                    if trigger_index < len(flat):
+                        sliced = flat[trigger_index : trigger_index + timebase]
+                        display_dict[name] = sliced
+                        
+        self.scope.update_samples(display_dict, self.synth_colors, self.visible_synths)
+        self.scope.update()
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -413,6 +816,18 @@ class MainWindow(QMainWindow):
         self.current_filepath = None
         self.update_window_title()
         self.resize(1600, 1000)
+        
+        self.synth_colors = {}
+        self.color_palette = [
+            QColor("#00ff00"), # Green
+            QColor("#00ffff"), # Cyan
+            QColor("#ff00ff"), # Magenta
+            QColor("#ffff00"), # Yellow
+            QColor("#ff8800"), # Orange
+            QColor("#0088ff"), # Blue
+            QColor("#ff0088"), # Pink
+            QColor("#88ff00")  # Lime
+        ]
 
         # Enable freeform docking
         self.setDockNestingEnabled(True)
@@ -425,6 +840,7 @@ class MainWindow(QMainWindow):
         # Layout memory
         self.settings = QSettings("Zeloof Designworks", "OSCAR IDE")
         self.load_layout()
+        self.setup_status_bar()
         self.setup_oscar_environment()
         self.setup_network()
         self.setup_shortcuts()
@@ -436,6 +852,39 @@ class MainWindow(QMainWindow):
 
         self.stdout_buffer = ""
         self.pending_context_menu = None
+        
+        self.editor_widget.modificationChanged.connect(self.update_window_title)
+
+    def check_unsaved_changes(self) -> bool:
+        """Returns True if it's safe to proceed, False if cancelled."""
+        if not self.editor_widget.isModified():
+            return True
+            
+        if not self.current_filepath and not self.editor_widget.text().strip():
+            return True
+
+        reply = QMessageBox.question(
+            self,
+            "Unsaved Changes",
+            "You have unsaved changes. Would you like to save them?",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save
+        )
+
+        if reply == QMessageBox.StandardButton.Save:
+            self.save_file()
+            return not self.editor_widget.isModified()
+        elif reply == QMessageBox.StandardButton.Discard:
+            return True
+        else:
+            return False
+
+    def closeEvent(self, event):
+        if self.check_unsaved_changes():
+            self.save_layout()
+            event.accept()
+        else:
+            event.ignore()
 
     def setup_oscar_environment(self):
         if self.settings.contains("oscar_render_path"):
@@ -449,6 +898,12 @@ class MainWindow(QMainWindow):
         else:
             self.settings.setValue("oscar_engine_path", "oscar_engine")
             self.oscar_engine_path = self.settings.value("oscar_engine_path")
+
+        if self.settings.contains("telemetry_port"):
+            self.telemetry_port = int(self.settings.value("telemetry_port"))
+        else:
+            self.settings.setValue("telemetry_port", 9393)
+            self.telemetry_port = 9393
 
     def create_interactive_patch(self, synth_name, channel_num):
         patch_name = f"p_{synth_name}_{channel_num}"
@@ -546,6 +1001,59 @@ class MainWindow(QMainWindow):
         if self.oscar_socket.state() == QTcpSocket.SocketState.UnconnectedState:
             self.oscar_socket.connectToHost("localhost", 5555)
 
+    def setup_status_bar(self):
+        self.status_bar = self.statusBar()
+        self.status_bar.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; border-top: 1px solid #444;")
+        
+        self.cpu_label = QLabel("CPU: 0.0%")
+        self.cpu_label.setFont(QFont("Consolas", 10))
+        self.status_bar.addWidget(self.cpu_label)
+        
+        self.engine_status = ConnectionStatusLabel("Engine", self.launch_engine)
+        self.status_bar.addPermanentWidget(self.engine_status)
+        
+        self.render_status = ConnectionStatusLabel("Renderer", self.launch_render)
+        self.status_bar.addPermanentWidget(self.render_status)
+        
+        # CPU Monitor Timer
+        self.prev_idle = 0
+        self.prev_total = 0
+        self.cpu_timer = QTimer(self)
+        self.cpu_timer.timeout.connect(self.update_cpu_load)
+        self.cpu_timer.start(1000)
+        
+        self.frames_received = 0
+        self.fps_timer = QTimer(self)
+        self.fps_timer.timeout.connect(self.update_fps)
+        self.fps_timer.start(1000)
+        
+    def update_cpu_load(self):
+        try:
+            with open('/proc/stat', 'r') as f:
+                lines = f.readlines()
+            cpu_line = lines[0].split()[1:]
+            cpu_times = [float(x) for x in cpu_line]
+            
+            idle = cpu_times[3] + cpu_times[4] # idle + iowait
+            total = sum(cpu_times)
+            
+            idle_delta = idle - self.prev_idle
+            total_delta = total - self.prev_total
+            
+            self.prev_idle = idle
+            self.prev_total = total
+            
+            if total_delta > 0:
+                load = 100.0 * (1.0 - idle_delta / total_delta)
+                self.cpu_label.setText(f"CPU: {load:.1f}%")
+        except Exception:
+            self.cpu_label.setText("CPU: N/A")
+            
+    def update_fps(self):
+        if hasattr(self, 'video_socket') and self.video_socket.state() == QTcpSocket.SocketState.ConnectedState:
+            self.render_status.set_connected(True, f"({self.frames_received} FPS)")
+        self.frames_received = 0
+
     def setup_video_network(self):
         """Spins up a local server to receive JPEGs from the C++ renderer."""
         self.expected_video_size = 0
@@ -556,8 +1064,17 @@ class MainWindow(QMainWindow):
     def accept_video_connection(self):
         self.video_socket = self.video_server.nextPendingConnection()
         self.video_socket.readyRead.connect(self.read_video_frame)
+        
+        def safe_video_disconnect():
+            try:
+                self.render_status.set_connected(False)
+            except RuntimeError:
+                pass
+                
+        self.video_socket.disconnected.connect(safe_video_disconnect)
         self.expected_video_size = 0
         self.console_output.appendPlainText("--- Renderer Video Feed Connected ---")
+        self.render_status.set_connected(True, "(0 FPS)")
 
     def read_video_frame(self):
         """Reads the framed TCP stream, decodes the JPEG, and paints it."""
@@ -577,6 +1094,7 @@ class MainWindow(QMainWindow):
                     self.expected_video_size = 0  # Reset state for the next frame
 
                     # Decode and Paint
+                    self.frames_received += 1
                     pixmap = QPixmap()
                     if pixmap.loadFromData(jpeg_data):
                         scaled_pixmap = pixmap.scaled(
@@ -601,10 +1119,12 @@ class MainWindow(QMainWindow):
         self.oscar_socket = QTcpSocket(self)
         self.oscar_socket.connected.connect(
             lambda: self.console_output.appendPlainText("--- IDE Connected to OSCAR Engine ---"))
+        self.oscar_socket.connected.connect(lambda: self.engine_status.set_connected(True))
         
         def safe_disconnect():
             try:
                 self.console_output.appendPlainText("--- Disconnected from OSCAR ---")
+                self.engine_status.set_connected(False)
             except RuntimeError:
                 pass
                 
@@ -616,6 +1136,29 @@ class MainWindow(QMainWindow):
 
         # Wire up the console input box
         self.console_input.returnPressed.connect(self.send_console_command)
+        
+        # UDP Telemetry Socket
+        self.udp_socket = QUdpSocket(self)
+        self.udp_socket.bind(QHostAddress.SpecialAddress.LocalHost, getattr(self, 'telemetry_port', 9393))
+        self.udp_socket.readyRead.connect(self.read_telemetry)
+
+    def read_telemetry(self):
+        while self.udp_socket.hasPendingDatagrams():
+            datagram, host, port = self.udp_socket.readDatagram(self.udp_socket.pendingDatagramSize())
+            if len(datagram) < 48:
+                continue
+            
+            header = datagram[:48]
+            try:
+                synth_name_b, num_samples, block_index = struct.unpack("<32si4xQ", header)
+                synth_name = synth_name_b.decode('utf-8').rstrip('\x00')
+                
+                expected_size = 48 + (num_samples * 4)
+                if len(datagram) >= expected_size:
+                    samples = struct.unpack(f"<{num_samples}f", datagram[48:expected_size])
+                    self.telemetry_bay_widget.push_telemetry(synth_name, block_index, samples)
+            except Exception:
+                pass
 
     def execute_editor_code(self):
         """Intelligently grabs code blocks and fires them to the OSCAR engine."""
@@ -694,11 +1237,23 @@ class MainWindow(QMainWindow):
                 json_str = line.replace("__STATE_SYNC__:", "").strip()
                 try:
                     state = json.loads(json_str)
+                    synths = state.get('synths', [])
+                    
+                    for s in synths:
+                        self.get_synth_color(s)
+                    self.editor_widget.update_synth_highlights(self.synth_colors)
+                    
                     self.patch_bay_widget.update_patch_bay(
-                        state.get('synths', []),
+                        synths,
                         state.get('channels', []),
-                        state.get('patches', [])
+                        state.get('patches', []),
+                        self.synth_colors
                     )
+                    
+                    new_synths = self.telemetry_bay_widget.sync_synths(synths, self.synth_colors)
+                    if new_synths and self.oscar_socket.state() == QTcpSocket.SocketState.ConnectedState:
+                        for s in new_synths:
+                            self.oscar_socket.write((f"{s}.visualize(True)\n").encode('utf-8'))
                 except Exception as e:
                     self.console_output.appendPlainText(f"! UI Sync Error: {str(e)}\n")
             elif line.startswith("__VOL__:"):
@@ -737,13 +1292,25 @@ class MainWindow(QMainWindow):
         if self.current_filepath:
             filename = os.path.basename(self.current_filepath)
             title = f"{title} - {filename}"
+        if hasattr(self, 'editor_widget') and self.editor_widget.isModified():
+            title += " *"
         self.setWindowTitle(title)
 
     def setup_menu(self):
         self.setup_file_menu()
         self.setup_edit_menu()
+        self.setup_window_menu()
         self.setup_oscar_menu()
         self.setup_help_menu()
+
+    def setup_window_menu(self):
+        window_menu = self.menuBar().addMenu("Window")
+        
+        window_menu.addAction(self.editor_dock.toggleViewAction())
+        window_menu.addAction(self.console_dock.toggleViewAction())
+        window_menu.addAction(self.preview_dock.toggleViewAction())
+        window_menu.addAction(self.patch_dock.toggleViewAction())
+        window_menu.addAction(self.telemetry_dock.toggleViewAction())
 
     def setup_file_menu(self):
         file_menu = self.menuBar().addMenu("File")
@@ -795,17 +1362,14 @@ class MainWindow(QMainWindow):
         about_dialog = QDialog(self)
         about_dialog.setWindowTitle("About OSCAR IDE")
         about_dialog.setFixedSize(400, 200)
-        text = QLabel(
-            """
+        layout = QVBoxLayout(about_dialog)
+        text = QLabel("""
 OSCAR IDE
-
 Version 0.1
-
 by Zeloof Designworks, LLC
-            """
-        )
+""")
         text.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        about_dialog.layout()#.addWidget(text)
+        layout.addWidget(text)
         about_dialog.exec()
 
     def setup_oscar_menu(self):
@@ -825,11 +1389,13 @@ by Zeloof Designworks, LLC
         launch_render_action.triggered.connect(self.launch_render)
         oscar_menu.addAction(launch_render_action)
 
-    def save_oscar_settings(self, renderer_path, engine_path, dialog):
+    def save_oscar_settings(self, renderer_path, engine_path, telemetry_port, dialog):
         self.settings.setValue("oscar_render_path", renderer_path)
         self.settings.setValue("oscar_engine_path", engine_path)
+        self.settings.setValue("telemetry_port", int(telemetry_port))
         self.oscar_render_path = renderer_path
         self.oscar_engine_path = engine_path
+        self.telemetry_port = int(telemetry_port)
         dialog.accept()
 
     def show_oscar_settings(self):
@@ -843,8 +1409,12 @@ by Zeloof Designworks, LLC
         engine_path_label = QLabel("OSCAR Engine Path:")
         engine_path_edit = QLineEdit(self.oscar_engine_path)
         layout.addRow(engine_path_label, engine_path_edit)
+        port_label = QLabel("Telemetry Port:")
+        port_edit = QLineEdit(str(getattr(self, 'telemetry_port', 9393)))
+        layout.addRow(port_label, port_edit)
+        
         save_button = QPushButton("Save")
-        save_button.clicked.connect(lambda: self.save_oscar_settings(renderer_path_edit.text(), engine_path_edit.text(), oscar_settings_dialog))
+        save_button.clicked.connect(lambda: self.save_oscar_settings(renderer_path_edit.text(), engine_path_edit.text(), port_edit.text(), oscar_settings_dialog))
         layout.addWidget(save_button)
         oscar_settings_dialog.setLayout(layout)
         oscar_settings_dialog.exec()
@@ -861,11 +1431,16 @@ by Zeloof Designworks, LLC
 
     # --- File Handling Methods ---
     def new_file(self):
+        if not self.check_unsaved_changes():
+            return
         self.editor_widget.clear()
         self.current_filepath = None
+        self.editor_widget.setModified(False)
         self.update_window_title()
 
     def open_file(self):
+        if not self.check_unsaved_changes():
+            return
         filepath, _ = QFileDialog.getOpenFileName(
             self, "Open File", "", "OSCAR Files (*.os);;Python Files (*.py);;All Files (*)"
         )
@@ -875,6 +1450,7 @@ by Zeloof Designworks, LLC
                     content = f.read()
                 self.editor_widget.setText(content)
                 self.current_filepath = filepath
+                self.editor_widget.setModified(False)
                 self.update_window_title()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Could not open file:\n{str(e)}")
@@ -900,6 +1476,7 @@ by Zeloof Designworks, LLC
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(content)
             self.console_output.appendPlainText(f"> Saved {filepath}")
+            self.editor_widget.setModified(False)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not save file:\n{str(e)}")
 
@@ -913,11 +1490,29 @@ by Zeloof Designworks, LLC
             self.restoreGeometry(self.settings.value("geometry"))
         if self.settings.value("windowState"):
             self.restoreState(self.settings.value("windowState"))
+            
+    def get_synth_color(self, synth_name):
+        if synth_name not in self.synth_colors:
+            idx = len(self.synth_colors) % len(self.color_palette)
+            self.synth_colors[synth_name] = self.color_palette[idx]
+        return self.synth_colors[synth_name]
 
     def query_synth_volume(self, synth_name):
         cmd = f"print(f'__VOL__:{synth_name}:{{{synth_name}.amp()}}')"
         if self.oscar_socket.state() == QTcpSocket.SocketState.ConnectedState:
             self.oscar_socket.write((cmd + '\n').encode('utf-8'))
+
+    def _on_telemetry_color_changed(self, synth_name, color):
+        self.synth_colors[synth_name] = color
+        self.editor_widget.update_synth_highlights(self.synth_colors)
+        
+        # Trigger an update on patch bay view
+        self.patch_bay_widget.update_patch_bay(
+            self.patch_bay_widget._synths,
+            self.patch_bay_widget._channels,
+            self.patch_bay_widget._patches,
+            self.synth_colors
+        )
 
     def setup_docks(self):
         # --- Editor Dock ---
@@ -964,6 +1559,13 @@ by Zeloof Designworks, LLC
         self.patch_bay_widget.set_callbacks(self.create_interactive_patch, self.delete_interactive_patch, self.show_synth_context_menu, self.query_synth_volume)
         self.patch_dock.setWidget(self.patch_bay_widget)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.patch_dock)
+
+        self.telemetry_dock = QDockWidget("Telemetry", self)
+        self.telemetry_dock.setObjectName("TelemetryDock")
+        self.telemetry_bay_widget = TelemetryBay(self)
+        self.telemetry_bay_widget.color_changed.connect(self._on_telemetry_color_changed)
+        self.telemetry_dock.setWidget(self.telemetry_bay_widget)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.telemetry_dock)
 
 
 if __name__ == "__main__":
