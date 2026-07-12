@@ -55,7 +55,7 @@ class OscarLexer(QsciLexerCustom):
         # Comments
         comment_pattern = r'#.*'
 
-        # Combine into one regex to find them all
+        # Combine into one regex to rule them all, and in the dark mode bind them
         # Use named groups
         self.regex = re.compile(
             f'(?P<COMMENT>{comment_pattern})|'

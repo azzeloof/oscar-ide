@@ -25,6 +25,15 @@ import itertools
 class ScintillaEditor(QsciScintilla):
     """A fully-featured code editor widget using QScintilla."""
 
+    def keyPressEvent(self, event):
+        # Break undo blocks on Enter or Space so the user can undo more granularly
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.beginUndoAction()
+            super().keyPressEvent(event)
+            self.endUndoAction()
+        else:
+            super().keyPressEvent(event)
+
     def __init__(self):
         super().__init__()
 
@@ -1470,6 +1479,16 @@ class MainWindow(QMainWindow):
 
     def setup_edit_menu(self):
         edit_menu = self.menuBar().addMenu("Edit")
+        
+        undo_text_action = QAction("Undo Text", self)
+        undo_text_action.setShortcut(QKeySequence.StandardKey.Undo)
+        undo_text_action.triggered.connect(self.editor_widget.undo)
+        edit_menu.addAction(undo_text_action)
+        
+        redo_text_action = QAction("Redo Text", self)
+        redo_text_action.setShortcut(QKeySequence.StandardKey.Redo)
+        redo_text_action.triggered.connect(self.editor_widget.redo)
+        edit_menu.addAction(redo_text_action)
 
     def setup_help_menu(self):
         help_menu = self.menuBar().addMenu("Help")
